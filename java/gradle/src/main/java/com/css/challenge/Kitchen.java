@@ -97,39 +97,41 @@ public class Kitchen {
     }
 
     actions.add(new Action(now, orderId, actionType, so.currentStorage));
-    ordersInProgress.decrementAndGet();
 
     // Proactively try to fill the vacated space from the shelf
     if (!so.currentStorage.equals(Action.SHELF)) {
       tryMoveToIdeal(so.currentStorage, now);
     }
+    ordersInProgress.decrementAndGet();
   }
 
   private void tryMoveToIdeal(String storageName, Instant now) {
     Storage targetStorage = getStorage(storageName);
-    for (StoredOrder so : shelf.getOrders()) {
-      if (getIdealStorage(so.order.getTemp()).equals(storageName) && targetStorage.hasSpace()) {
-        shelf.remove(so);
-        so.moveTo(storageName, now);
-        targetStorage.add(so, now);
-        actions.add(new Action(now, so.order.getId(), Action.MOVE, storageName));
-        LOGGER.info("Action: PROACTIVE MOVE {} from shelf to {}", so.order.getId(), storageName);
-        // Continue to fill if there's still space
-        if (!targetStorage.hasSpace()) break;
-      }
+    while (targetStorage.hasSpace()) {
+      StoredOrder so = shelf.getSoonestToExpireForIdeal(storageName);
+      if (so == null) break;
+      shelf.remove(so);
+      so.moveTo(storageName, now);
+      targetStorage.add(so, now);
+      actions.add(new Action(now, so.order.getId(), Action.MOVE, storageName));
+      LOGGER.info("Action: PROACTIVE MOVE {} from shelf to {}", so.order.getId(), storageName);
     }
   }
 
   private StoredOrder tryMoveFromShelf(Instant now) {
-    for (StoredOrder so : shelf.getOrders()) {
-      String ideal = getIdealStorage(so.order.getTemp());
-      if (!ideal.equals(Action.SHELF) && getStorage(ideal).hasSpace()) {
-        shelf.remove(so);
-        so.moveTo(ideal, now);
-        getStorage(ideal).add(so, now);
-        actions.add(new Action(now, so.order.getId(), Action.MOVE, ideal));
-        LOGGER.info("Action: MOVE {} from shelf to {}", so.order.getId(), ideal);
-        return so;
+    // Try to move anything that can move off the shelf.
+    // Check heater first, then cooler.
+    for (String ideal : List.of(Action.HEATER, Action.COOLER)) {
+      if (getStorage(ideal).hasSpace()) {
+        StoredOrder so = shelf.getSoonestToExpireForIdeal(ideal);
+        if (so != null) {
+          shelf.remove(so);
+          so.moveTo(ideal, now);
+          getStorage(ideal).add(so, now);
+          actions.add(new Action(now, so.order.getId(), Action.MOVE, ideal));
+          LOGGER.info("Action: MOVE {} from shelf to {}", so.order.getId(), ideal);
+          return so;
+        }
       }
     }
     return null;
@@ -148,7 +150,7 @@ public class Kitchen {
     }
   }
 
-  private String getIdealStorage(String temp) {
+  private static String getIdealStorage(String temp) {
     return switch (temp) {
       case "hot" -> Action.HEATER;
       case "cold" -> Action.COOLER;
@@ -186,9 +188,18 @@ public class Kitchen {
     // Using a TreeSet to keep orders sorted by expiry time for O(log N) discard logic.
     final TreeSet<StoredOrder> orders = new TreeSet<>(StoredOrder.EXPIRY_COMPARATOR);
 
+    // Indices for faster lookup of items by their ideal storage.
+    // Only used for the shelf storage to fulfill the "better than linear" requirement for moves too.
+    final Map<String, TreeSet<StoredOrder>> byIdealStorage = new HashMap<>();
+
     Storage(String name, int capacity) {
       this.name = name;
       this.capacity = capacity;
+      if (Action.SHELF.equals(name)) {
+        byIdealStorage.put(Action.HEATER, new TreeSet<>(StoredOrder.EXPIRY_COMPARATOR));
+        byIdealStorage.put(Action.COOLER, new TreeSet<>(StoredOrder.EXPIRY_COMPARATOR));
+        byIdealStorage.put(Action.SHELF, new TreeSet<>(StoredOrder.EXPIRY_COMPARATOR));
+      }
     }
 
     boolean hasSpace() {
@@ -198,18 +209,28 @@ public class Kitchen {
     void add(StoredOrder order, Instant now) {
       order.updateExpiry(now);
       orders.add(order);
+      if (Action.SHELF.equals(name)) {
+        String ideal = getIdealStorage(order.order.getTemp());
+        byIdealStorage.get(ideal).add(order);
+      }
     }
 
     void remove(StoredOrder order) {
       orders.remove(order);
-    }
-
-    Collection<StoredOrder> getOrders() {
-      return new ArrayList<>(orders);
+      if (Action.SHELF.equals(name)) {
+        String ideal = getIdealStorage(order.order.getTemp());
+        byIdealStorage.get(ideal).remove(order);
+      }
     }
 
     StoredOrder getSoonestToExpire() {
       return orders.isEmpty() ? null : orders.first();
+    }
+
+    StoredOrder getSoonestToExpireForIdeal(String ideal) {
+      if (!Action.SHELF.equals(name)) return null;
+      TreeSet<StoredOrder> set = byIdealStorage.get(ideal);
+      return (set == null || set.isEmpty()) ? null : set.first();
     }
   }
 
@@ -260,13 +281,7 @@ public class Kitchen {
     }
 
     boolean isAtIdealStorage() {
-      String ideal =
-          switch (order.getTemp()) {
-            case "hot" -> Action.HEATER;
-            case "cold" -> Action.COOLER;
-            default -> Action.SHELF;
-          };
-      return ideal.equals(currentStorage);
+      return getIdealStorage(order.getTemp()).equals(currentStorage);
     }
 
     boolean isExpired(Instant now) {
