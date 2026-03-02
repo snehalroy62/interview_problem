@@ -12,3 +12,8 @@ target/
 *.log
 bin/
 obj/
+# Gradle files
+java/gradle/.gradle/
+java/gradle/build/
+java/gradle/out/
+java/gradle/.idea/
