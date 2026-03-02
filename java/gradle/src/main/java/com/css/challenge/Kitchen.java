@@ -98,6 +98,26 @@ public class Kitchen {
 
     actions.add(new Action(now, orderId, actionType, so.currentStorage));
     ordersInProgress.decrementAndGet();
+
+    // Proactively try to fill the vacated space from the shelf
+    if (!so.currentStorage.equals(Action.SHELF)) {
+      tryMoveToIdeal(so.currentStorage, now);
+    }
+  }
+
+  private void tryMoveToIdeal(String storageName, Instant now) {
+    Storage targetStorage = getStorage(storageName);
+    for (StoredOrder so : shelf.getOrders()) {
+      if (getIdealStorage(so.order.getTemp()).equals(storageName) && targetStorage.hasSpace()) {
+        shelf.remove(so);
+        so.moveTo(storageName, now);
+        targetStorage.add(so, now);
+        actions.add(new Action(now, so.order.getId(), Action.MOVE, storageName));
+        LOGGER.info("Action: PROACTIVE MOVE {} from shelf to {}", so.order.getId(), storageName);
+        // Continue to fill if there's still space
+        if (!targetStorage.hasSpace()) break;
+      }
+    }
   }
 
   private StoredOrder tryMoveFromShelf(Instant now) {
