@@ -99,7 +99,7 @@ public class Kitchen {
     actions.add(new Action(now, orderId, actionType, so.currentStorage));
 
     // Proactively try to fill the vacated space from the shelf
-    if (!so.currentStorage.equals(Action.SHELF)) {
+    if (!so.currentStorage.equals(Action.SHELF) && !shelf.hasSpace()) {
       tryMoveToIdeal(so.currentStorage, now);
     }
     ordersInProgress.decrementAndGet();
