@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Run Challenge" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.css.challenge.Main" />
+    <module name="challenge.main" />
+    <option name="PROGRAM_PARAMETERS" value="--auth=h9ruoqz5xab5" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

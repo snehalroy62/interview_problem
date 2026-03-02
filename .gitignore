@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+.gradle/
+build/
+out/
+target/
+*.class
+*.exe
+*.dll
+*.so
+*.dylib
+*.log
+bin/
+obj/

@@ -1,0 +1,35 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.css'
+version = '1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // https://picocli.info/
+    implementation 'info.picocli:picocli:4.7.7'
+    // https://mvnrepository.com/artifact/com.fasterxml.jackson.core/jackson-databind
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.21.0'
+    implementation 'com.squareup.okhttp3:okhttp:5.3.2'
+    implementation 'org.slf4j:slf4j-jdk14:2.0.17'
+}
+
+application {
+    mainClass.set("com.css.challenge.Main")
+}
+
+// Correctly add program arguments to the run task
+run {
+    args = ["--auth=h9ruoqz5xab5"]
+}
