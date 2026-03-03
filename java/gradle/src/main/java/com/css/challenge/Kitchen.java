@@ -7,25 +7,26 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * Kitchen manages the storage and fulfillment of food orders.
- * It handles placement, movement, and pickup logic, ensuring orders are stored
- * correctly and discarded if they expire or if space is needed.
- */
 public class Kitchen {
   private static final Logger LOGGER = LoggerFactory.getLogger(Kitchen.class);
 
   private final Storage heater = new Storage(Action.HEATER, 6);
   private final Storage cooler = new Storage(Action.COOLER, 6);
   private final Storage shelf = new Storage(Action.SHELF, 12);
-
+  
   private final Map<String, StoredOrder> activeOrders = new ConcurrentHashMap<>();
   private final List<Action> actions = Collections.synchronizedList(new ArrayList<>());
   private final AtomicInteger ordersInProgress = new AtomicInteger(0);
-  private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
+  
+  private Instant lastTimestamp = Instant.EPOCH;
+
+  private final ExecutorService workerPool = Executors.newFixedThreadPool(
+      Runtime.getRuntime().availableProcessors()
+  );
 
   private final Duration minPickup;
   private final Duration maxPickup;
@@ -35,117 +36,140 @@ public class Kitchen {
     this.maxPickup = maxPickup;
   }
 
-  /**
-   * Receives a new order and places it in the appropriate storage.
-   * Schedules a random pickup time for the order.
-   */
-  public synchronized void receiveOrder(Order order) {
-    ordersInProgress.incrementAndGet();
+  private synchronized void recordAction(String id, String name, String type, String target) {
     Instant now = Instant.now();
-    String ideal = getIdealStorage(order.getTemp());
+    if (!now.isAfter(lastTimestamp)) {
+      now = lastTimestamp.plusNanos(1000); // Monotonic microsecond precision
+    }
+    lastTimestamp = now;
+    actions.add(new Action(now, id, name, type, target));
+  }
 
-    String target = ideal;
-    Storage targetStorage = getStorage(ideal);
+  /**
+   * Receives a new order using Full Async CompletableFuture chains.
+   */
+  public CompletableFuture<Void> receiveOrder(Order order) {
+    ordersInProgress.incrementAndGet();
+    
+    return CompletableFuture.runAsync(() -> {
+      Instant now = Instant.now();
+      String ideal = getIdealStorage(order.getTemp());
 
-    if (!targetStorage.hasSpace()) {
-      if (!ideal.equals(Action.SHELF) && shelf.hasSpace()) {
-        target = Action.SHELF;
-      } else {
-        // Shelf is full or ideal was shelf and it's full.
-        // Try to move something from shelf to its ideal storage to make room.
-        StoredOrder moved = tryMoveFromShelf(now);
-        if (moved != null) {
-          target = Action.SHELF;
-        } else {
-          // No space to move, must discard an item from the shelf.
-          discardFromShelf(now);
-          target = Action.SHELF;
-        }
+      boolean placed = tryPlace(order, ideal, now);
+      if (!placed) {
+        reorganizeAndPlace(order, ideal, now);
       }
+    }, workerPool).thenRunAsync(() -> {
+      // Schedule the pickup in the future
+      long delayMillis = ThreadLocalRandom.current().nextLong(minPickup.toMillis(), maxPickup.toMillis() + 1);
+      
+      CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS, workerPool)
+          .execute(() -> pickupOrder(order.getId()));
+    }, workerPool);
+  }
+
+  private boolean tryPlace(Order order, String ideal, Instant now) {
+    Storage target = getStorage(ideal);
+    target.lock.lock();
+    try {
+      if (target.hasSpace()) {
+        place(order, ideal, now);
+        return true;
+      }
+    } finally {
+      target.lock.unlock();
     }
 
-    place(order, target, now);
+    if (!ideal.equals(Action.SHELF)) {
+      shelf.lock.lock();
+      try {
+        if (shelf.hasSpace()) {
+          place(order, Action.SHELF, now);
+          return true;
+        }
+      } finally {
+        shelf.lock.unlock();
+      }
+    }
+    return false;
+  }
 
-    // Schedule random pickup
-    long delayMillis =
-        ThreadLocalRandom.current().nextLong(minPickup.toMillis(), maxPickup.toMillis() + 1);
-    scheduler.schedule(() -> pickupOrder(order.getId()), delayMillis, TimeUnit.MILLISECONDS);
+  private void reorganizeAndPlace(Order order, String ideal, Instant now) {
+    shelf.lock.lock();
+    try {
+      if (shelf.hasSpace()) {
+        place(order, Action.SHELF, now);
+        return;
+      }
+
+      StoredOrder moved = tryMoveFromShelf(now);
+      if (moved != null) {
+        place(order, Action.SHELF, now);
+      } else {
+        discardFromShelf(now);
+        place(order, Action.SHELF, now);
+      }
+    } finally {
+      shelf.lock.unlock();
+    }
   }
 
   private void place(Order order, String storageName, Instant now) {
     StoredOrder so = new StoredOrder(order, now, storageName);
     getStorage(storageName).add(so, now);
     activeOrders.put(order.getId(), so);
-    actions.add(new Action(now, order.getId(), Action.PLACE, storageName));
-    LOGGER.info("Action: PLACE {} in {}", order.getId(), storageName);
+    recordAction(order.getId(), order.getName(), Action.PLACE, storageName);
+    LOGGER.info("Action: PLACE {} ({}) in {}", order.getId(), order.getName(), storageName);
   }
 
-  private synchronized void pickupOrder(String orderId) {
+  private void pickupOrder(String orderId) {
     Instant now = Instant.now();
     StoredOrder so = activeOrders.remove(orderId);
-    if (so == null) return; // Already discarded
+    if (so == null) return;
 
-    getStorage(so.currentStorage).remove(so);
-
-    String actionType;
-    if (so.isExpired(now)) {
-      actionType = Action.DISCARD;
-      LOGGER.info("Action: DISCARD {} from {} (EXPIRED)", orderId, so.currentStorage);
-    } else {
-      actionType = Action.PICKUP;
-      LOGGER.info("Action: PICKUP {} from {}", orderId, so.currentStorage);
-    }
-
-    actions.add(new Action(now, orderId, actionType, so.currentStorage));
-
-    // Proactively try to fill the vacated space from the shelf
-    if (!so.currentStorage.equals(Action.SHELF) && !shelf.hasSpace()) {
-      tryMoveToIdeal(so.currentStorage, now);
+    Storage storage = getStorage(so.currentStorage);
+    storage.lock.lock();
+    try {
+      storage.remove(so);
+      String actionType = so.isExpired(now) ? Action.DISCARD : Action.PICKUP;
+      recordAction(orderId, so.order.getName(), actionType, so.currentStorage);
+      LOGGER.info("Action: {} {} ({}) from {}", actionType.toUpperCase(), orderId, so.order.getName(), so.currentStorage);
+    } finally {
+      storage.lock.unlock();
     }
     ordersInProgress.decrementAndGet();
   }
 
-  private void tryMoveToIdeal(String storageName, Instant now) {
-    Storage targetStorage = getStorage(storageName);
-    while (targetStorage.hasSpace()) {
-      StoredOrder so = shelf.getSoonestToExpireForIdeal(storageName);
-      if (so == null) break;
-      shelf.remove(so);
-      so.moveTo(storageName, now);
-      targetStorage.add(so, now);
-      actions.add(new Action(now, so.order.getId(), Action.MOVE, storageName));
-      LOGGER.info("Action: PROACTIVE MOVE {} from shelf to {}", so.order.getId(), storageName);
-    }
-  }
-
   private StoredOrder tryMoveFromShelf(Instant now) {
-    // Try to move anything that can move off the shelf.
-    // Check heater first, then cooler.
     for (String ideal : List.of(Action.HEATER, Action.COOLER)) {
-      if (getStorage(ideal).hasSpace()) {
-        StoredOrder so = shelf.getSoonestToExpireForIdeal(ideal);
-        if (so != null) {
-          shelf.remove(so);
-          so.moveTo(ideal, now);
-          getStorage(ideal).add(so, now);
-          actions.add(new Action(now, so.order.getId(), Action.MOVE, ideal));
-          LOGGER.info("Action: MOVE {} from shelf to {}", so.order.getId(), ideal);
-          return so;
+      Storage idealStorage = getStorage(ideal);
+      idealStorage.lock.lock();
+      try {
+        if (idealStorage.hasSpace()) {
+          StoredOrder so = shelf.getSoonestToExpireForIdeal(ideal);
+          if (so != null) {
+            shelf.remove(so);
+            so.moveTo(ideal, now);
+            idealStorage.add(so, now);
+            recordAction(so.order.getId(), so.order.getName(), Action.MOVE, ideal);
+            LOGGER.info("Action: MOVE {} ({}) from shelf to {}", so.order.getId(), so.order.getName(), ideal);
+            return so;
+          }
         }
+      } finally {
+        idealStorage.lock.unlock();
       }
     }
     return null;
   }
 
   private void discardFromShelf(Instant now) {
-    // Discard the item that expires soonest.
-    // Storage.getOldest() returns the order with the earliest expiryInstant.
     StoredOrder worst = shelf.getSoonestToExpire();
     if (worst != null) {
       shelf.remove(worst);
       activeOrders.remove(worst.order.getId());
-      actions.add(new Action(now, worst.order.getId(), Action.DISCARD, Action.SHELF));
-      LOGGER.info("Action: DISCARD {} from shelf (SHELF FULL, soonest to expire)", worst.order.getId());
+      recordAction(worst.order.getId(), worst.order.getName(), Action.DISCARD, Action.SHELF);
+      LOGGER.info("Action: DISCARD {} ({}) from shelf (FULL)", worst.order.getId(), worst.order.getName());
       ordersInProgress.decrementAndGet();
     }
   }
@@ -169,13 +193,13 @@ public class Kitchen {
   public void waitUntilDone() {
     while (ordersInProgress.get() > 0) {
       try {
-        Thread.sleep(100);
+        Thread.sleep(10); // Polling more frequently (10ms)
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         break;
       }
     }
-    scheduler.shutdown();
+    workerPool.shutdown();
   }
 
   public List<Action> getActions() {
@@ -185,11 +209,8 @@ public class Kitchen {
   private static class Storage {
     final String name;
     final int capacity;
-    // Using a TreeSet to keep orders sorted by expiry time for O(log N) discard logic.
+    final ReentrantLock lock = new ReentrantLock();
     final TreeSet<StoredOrder> orders = new TreeSet<>(StoredOrder.EXPIRY_COMPARATOR);
-
-    // Indices for faster lookup of items by their ideal storage.
-    // Only used for the shelf storage to fulfill the "better than linear" requirement for moves too.
     final Map<String, TreeSet<StoredOrder>> byIdealStorage = new HashMap<>();
 
     Storage(String name, int capacity) {

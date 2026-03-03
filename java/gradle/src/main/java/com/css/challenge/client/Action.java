@@ -16,12 +16,14 @@ public class Action {
 
   private final long timestamp; // unix timestamp in microseconds
   private final String id; // order id
+  private final String name; // food name
   private final String action; // place, move, pickup or discard
   private final String target; // heater, cooler or shelf. Target is the destination for move
 
-  public Action(Instant timestamp, String id, String action, String target) {
+  public Action(Instant timestamp, String id, String name, String action, String target) {
     this.timestamp = ChronoUnit.MICROS.between(Instant.EPOCH, timestamp);
     this.id = id;
+    this.name = name;
     this.action = action;
     this.target = target;
   }
@@ -32,6 +34,10 @@ public class Action {
 
   public String getId() {
     return id;
+  }
+
+  public String getName() {
+    return name;
   }
 
   public String getAction() {
@@ -48,6 +54,8 @@ public class Action {
         + timestamp
         + ", id: "
         + id
+        + ", name: "
+        + name
         + ", action: "
         + action
         + ", target: "
